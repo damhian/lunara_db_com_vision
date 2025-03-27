@@ -22,6 +22,8 @@ CACHE_EXPIRATION = timedelta(minutes=6)
 
 async def test_stream_async(stream_url):
     try:
+        process = None
+        
         # Run FFmpeg asynchronously to probe the stream
         process = await asyncio.create_subprocess_exec(
             "ffmpeg", "-i", stream_url, "-t", "5", "-f", "null", "-",
