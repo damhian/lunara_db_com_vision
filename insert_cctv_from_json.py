@@ -29,7 +29,8 @@ def insert_data_from_json(file_path):
             data = json.load(file)
 
         # Extract the resource list
-        resources = data.get("data", {}).get("resource", [])
+        # resources = data.get("data", {}).get("resource", [])
+        resources = data.get("data", [])
 
         if not resources:
             print("No resources found in the JSON file.")
@@ -45,14 +46,20 @@ def insert_data_from_json(file_path):
                 longitude = clean_coordinate(resource.get("long"))                
                 
                 new_cctv = MsCCTV(
-                    Id=uuid.uuid4(),  # Generate a new UUID
-                    CCTV_Name=resource.get("nama_cctv"),
-                    Ruas_Name=resource.get("nama_ruas"),
-                    Stream_url=resource.get("stream"),
-                    Lat=latitude,
-                    Long=longitude,
-                    BUJT=resource.get("bujt"),
-                    BUJT_NAME=resource.get("bujt_nama"),
+                    id=uuid.uuid4(),  # Generate a new UUID
+                    nama_lokasi=resource.get("nama_lokasi"),
+                    nama_cctv=resource.get("nama_cctv"),
+                    stream_url=resource.get("stream_url"),
+                    status=resource.get("status"),
+                    nama_pengelola=resource.get("nama_pengelola"),
+                    protocol=resource.get("protocol"),
+                    latitude=resource.get("latitude"),
+                    longitude=resource.get("longitude"),
+                    source=resource.get("source"),
+                    tag_kategori=resource.get("tag_kategori"),
+                    matra=resource.get("matra"),
+                    nama_kabupaten_kota=resource.get("nama_kabupaten_kota"),
+                    nama_provinsi=resource.get("nama_provinsi")
                 )
 
                 # Add the object to the session
