@@ -31,7 +31,7 @@ async def test_stream_async(stream_url):
             stderr=asyncio.subprocess.PIPE
         )
         
-        await asyncio.wait_for(process.wait(), timeout=5)
+        await asyncio.wait_for(process.wait(), timeout=15)
 
         if process.returncode == 0:
             return "online"
