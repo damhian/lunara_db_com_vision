@@ -9,11 +9,18 @@ from app.config import Config
 Base = declarative_base()
 engine = create_engine(
     Config.SQLALCHEMY_DATABASE_URI, 
-    pool_size=10,
-    max_overflow=20,
-    pool_timeout=30,
-    pool_recycle=3600,
-    echo=False
+    pool_size=5,
+    max_overflow=5,
+    pool_timeout=10,
+    pool_recycle=300,
+    echo=False,
+    connect_args={
+        "connect_timeout": 5,     
+        "keepalives": 1,          
+        "keepalives_idle": 30,    
+        "keepalives_interval": 10, 
+        "keepalives_count": 5      
+    }
 )
 
 # Session Factory
