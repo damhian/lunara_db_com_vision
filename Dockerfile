@@ -20,7 +20,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 # Install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt gunicorn
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Stage 2: Runtime image
 FROM python:3.12.8-slim
@@ -52,4 +52,4 @@ HEALTHCHECK --interval=30s --timeout=3s \
 EXPOSE 5001
 
 # Run with Gunicorn for production
-CMD ["gunicorn", "--bind", "0.0.0.0:5001", "--workers", "4", "--threads", "2", "--timeout", "120", "run:app"]
+# CMD ["gunicorn", "--bind", "0.0.0.0:5001", "--workers", "4", "--threads", "2", "--timeout", "120", "run:app"]
