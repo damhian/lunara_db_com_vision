@@ -21,39 +21,73 @@ cache_lock = threading.Lock()
 CACHE_EXPIRATION = timedelta(minutes=6)
 
 async def test_stream_async(stream_url):
+    process = None
     try:
-        process = None
+        logging.info(f"🔍 Starting stream check for: {stream_url}")
         
-        # Run FFmpeg asynchronously to probe the stream
+        ffmpeg_command = [
+            "ffmpeg", "-i", stream_url, 
+            "-t", "5", 
+            "-f", "null", "-"
+        ]
+        logging.debug(f"⚙️ FFmpeg command: {' '.join(ffmpeg_command)}")
+
         process = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-i", stream_url, "-t", "5", "-f", "null", "-",
+            *ffmpeg_command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        
-        await asyncio.wait_for(process.wait(), timeout=15)
 
-        if process.returncode == 0:
+        async def log_stream(stream, prefix):
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                logging.debug(f"{prefix} {line.decode().strip()}")
+
+        stdout_logger = asyncio.create_task(log_stream(process.stdout, "FFmpeg stdout:"))
+        stderr_logger = asyncio.create_task(log_stream(process.stderr, "FFmpeg stderr:"))
+
+        try:
+            return_code = await asyncio.wait_for(process.wait(), timeout=15)
+            await asyncio.gather(stdout_logger, stderr_logger)  # Ensure all output is logged
+        except asyncio.TimeoutError:
+            logging.warning(f"⏱️ Timeout occurred for {stream_url}")
+            raise
+
+        logging.info(f"🔚 Process completed with return code: {return_code}")
+        if return_code == 0:
+            logging.info(f"✅ Stream ONLINE: {stream_url}")
             return "online"
         else:
             stderr = await process.stderr.read()
-            logging.error(f"FFmpeg error for stream {stream_url}: {stderr.decode()}")
+            if stderr:
+                logging.error(f"❌ FFmpeg error output:\n{stderr.decode()}")
             return "offline"
 
     except asyncio.TimeoutError:
-        logging.error(f"FFmpeg timeout for stream {stream_url}")
+        logging.error(f"⌛ Timeout exceeded for stream: {stream_url}")
         if process and process.returncode is None:
-            process.terminate()  # Kill the process if it's still running
+            logging.warning("🛑 Terminating stuck FFmpeg process...")
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                logging.critical("💥 Failed to terminate FFmpeg!")
         return "offline"
 
     except Exception as e:
-        logging.error(f"Unexpected error for stream {stream_url}: {str(e)}")
+        logging.error(f"⚠️ Unexpected error checking {stream_url}:", exc_info=True)
         return "offline"
 
     finally:
         if process and process.returncode is None:
-            process.terminate()  # Ensure FFmpeg is terminated
-            await process.wait()  # Wait for termination
+            logging.warning("🧹 Cleaning up lingering FFmpeg process...")
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                logging.error("🔴 Failed to clean up FFmpeg process!")
 
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
 async def update_cctv_status_cache():
