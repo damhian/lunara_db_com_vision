@@ -5,8 +5,10 @@ import ffmpeg
 import threading
 import multiprocessing
 import requests
+import os
+from contextlib import contextmanager
 from multiprocessing import Process
-from datetime import timedelta
+from datetime import timedelta, datetime
 from functools import cache
 from flask import Flask, jsonify, request
 from .db import SessionLocal, engine, Base
@@ -16,21 +18,59 @@ from tenacity import retry, stop_after_attempt, wait_fixed
 from .models import MsCCTV
 from .models import MsROI
 
+# Configuration
+CACHE_EXPIRATION = timedelta(minutes=6)
+STREAM_CHECK_TIMEOUT = 15
+MAX_CONCURRENT_CHECKS = 2  # Adjust based on CPU cores
+FFMPEG_THREADS_PER_PROCESS = 2  # Recommended: 1-2 threads per FFmpeg process
+
 cache = {}
 cache_lock = threading.Lock()
-CACHE_EXPIRATION = timedelta(minutes=6)
+stream_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
 
+# Logging setup
+def setup_logging():
+    log_dir = "stream_logs"
+    os.makedirs(log_dir, exist_ok=True)
+    log_filename = os.path.join(log_dir, f"stream_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_filename),
+            logging.StreamHandler()
+        ]
+    )
+    logging.info(f"Logging initialized to {log_filename}")
+
+setup_logging()
+
+# Database context manager
+@contextmanager
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# Optimized stream testing
 async def test_stream_async(stream_url):
     process = None
     try:
-        logging.info(f"🔍 Starting stream check for: {stream_url}")
+        logging.debug(f"Testing stream: {stream_url}")
         
         ffmpeg_command = [
-            "ffmpeg", "-i", stream_url, 
-            "-t", "5", 
+            "ffmpeg",
+            "-loglevel", "error",
+            "-threads", str(FFMPEG_THREADS_PER_PROCESS),
+            "-i", stream_url,
+            "-t", "5",
+            "-cpu-used", "2",
+            "-frames:v", "15",
             "-f", "null", "-"
         ]
-        logging.debug(f"⚙️ FFmpeg command: {' '.join(ffmpeg_command)}")
 
         process = await asyncio.create_subprocess_exec(
             *ffmpeg_command,
@@ -38,130 +78,148 @@ async def test_stream_async(stream_url):
             stderr=asyncio.subprocess.PIPE
         )
 
-        async def log_stream(stream, prefix):
-            while True:
-                line = await stream.readline()
-                if not line:
-                    break
-                logging.debug(f"{prefix} {line.decode().strip()}")
-
-        stdout_logger = asyncio.create_task(log_stream(process.stdout, "FFmpeg stdout:"))
-        stderr_logger = asyncio.create_task(log_stream(process.stderr, "FFmpeg stderr:"))
-
         try:
-            return_code = await asyncio.wait_for(process.wait(), timeout=15)
-            await asyncio.gather(stdout_logger, stderr_logger)  # Ensure all output is logged
+            return_code = await asyncio.wait_for(process.wait(), timeout=STREAM_CHECK_TIMEOUT)
+            if return_code == 0:
+                return "online"
+            return "offline"
         except asyncio.TimeoutError:
-            logging.warning(f"⏱️ Timeout occurred for {stream_url}")
+            logging.warning(f"Timeout checking {stream_url}")
             raise
 
-        logging.info(f"🔚 Process completed with return code: {return_code}")
-        if return_code == 0:
-            logging.info(f"✅ Stream ONLINE: {stream_url}")
-            return "online"
-        else:
-            stderr = await process.stderr.read()
-            if stderr:
-                logging.error(f"❌ FFmpeg error output:\n{stderr.decode()}")
-            return "offline"
-
-    except asyncio.TimeoutError:
-        logging.error(f"⌛ Timeout exceeded for stream: {stream_url}")
-        if process and process.returncode is None:
-            logging.warning("🛑 Terminating stuck FFmpeg process...")
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                logging.critical("💥 Failed to terminate FFmpeg!")
-        return "offline"
-
     except Exception as e:
-        logging.error(f"⚠️ Unexpected error checking {stream_url}:", exc_info=True)
+        logging.error(f"Error checking stream {stream_url}: {str(e)}")
         return "offline"
-
     finally:
         if process and process.returncode is None:
-            logging.warning("🧹 Cleaning up lingering FFmpeg process...")
-            process.terminate()
             try:
-                await asyncio.wait_for(process.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                logging.error("🔴 Failed to clean up FFmpeg process!")
+                process.terminate()
+                await asyncio.wait_for(process.wait(), timeout=2)
+            except:
+                pass
+            
+async def fetch_cctv_status(cctvs):
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
+    
+    async def process_cctv(cctv):
+        async with semaphore:
+            try:
+                if not cctv.stream_url:
+                    return (cctv, "invalid")
+                    
+                with cache_lock:
+                    cached = cache.get(cctv.stream_url)
+                    if cached and datetime.now() < cached["expires"]:
+                        return (cctv, cached["status"])
+                
+                status = await test_stream_async(cctv.stream_url)
+                
+                with cache_lock:
+                    cache[cctv.stream_url] = {
+                        "status": status,
+                        "expires": datetime.now() + CACHE_EXPIRATION
+                    }
+                
+                return (cctv, status)
+            except Exception as e:
+                logging.error(f"Error processing {cctv.stream_url}: {e}")
+                return (cctv, "error")
+    
+    return await asyncio.gather(*[process_cctv(c) for c in cctvs])
 
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
 async def update_cctv_status_cache():
     while True:
-        session = SessionLocal()
-        try: 
-            cctvs = session.query(MsCCTV).options(joinedload(MsCCTV.rois)).all()
-            cctv_status = await fetch_cctv_status(cctvs)
-            cache.clear()
-            # Update the cache with new statuses
-            for cctv, status in cctv_status:
-                cache[cctv.stream_url] = {
-                    "status": status,
-                    "expires": datetime.datetime.now() + CACHE_EXPIRATION,
-                    "cctv_data": {
-                        "id": str(cctv.id),
-                        "nama_lokasi": cctv.nama_lokasi,
-                        "nama_cctv": cctv.nama_cctv,
-                        "stream_url": cctv.stream_url,
-                        "nama_pengelola": cctv.nama_pengelola,
-                        "protocol": cctv.protocol,
-                        "latitude": cctv.latitude,
-                        "longitude": cctv.longitude,
-                        "source": cctv.source,
-                        "tag_kategori": cctv.tag_kategori,
-                        "matra": cctv.matra,
-                        "nama_kabupaten_kota": cctv.nama_kabupaten_kota,
-                        "nama_provinsi": cctv.nama_provinsi,
-                        "status": cctv.status,
-                        "created_at": cctv.created_at.strftime("%a, %d %b %Y %H:%M:%S GMT"),
-                        "updated_at": cctv.updated_at.strftime("%a, %d %b %Y %H:%M:%S GMT"),
-                        "rois": [roi.to_dict() for roi in cctv.rois]
-                    }
-                }
-            logging.info("CCTV status cache updated")
+        start_time = datetime.now()
+        update_count = 0
+        try:
+            with get_db() as db:
+                # Get all CCTV data with relationships
+                cctvs = db.query(MsCCTV).options(
+                    joinedload(MsCCTV.rois)
+                ).all()
+                
+                # Process in batches with progress tracking
+                batch_size = min(MAX_CONCURRENT_CHECKS * 2, 20)  # Cap at 20
+                total_batches = (len(cctvs) + batch_size - 1) // batch_size
+                
+                for batch_num, i in enumerate(range(0, len(cctvs), batch_size)):
+                    batch = cctvs[i:i + batch_size]
+                    
+                    # Process batch
+                    batch_statuses = await fetch_cctv_status(batch)
+                    
+                    # Update cache
+                    with cache_lock:
+                        for cctv, status in batch_statuses:
+                            cache[cctv.stream_url] = {
+                                "status": status,
+                                "expires": datetime.now() + CACHE_EXPIRATION,
+                                "cctv_data": {
+                                    "id": str(cctv.id),
+                                    "nama_lokasi": cctv.nama_lokasi,
+                                    "nama_cctv": cctv.nama_cctv,
+                                    "stream_url": cctv.stream_url,
+                                    "nama_pengelola": cctv.nama_pengelola,
+                                    "protocol": cctv.protocol,
+                                    "latitude": float(cctv.latitude) if cctv.latitude else None,
+                                    "longitude": float(cctv.longitude) if cctv.longitude else None,
+                                    "source": cctv.source,
+                                    "tag_kategori": cctv.tag_kategori,
+                                    "matra": cctv.matra,
+                                    "nama_kabupaten_kota": cctv.nama_kabupaten_kota,
+                                    "nama_provinsi": cctv.nama_provinsi,
+                                    "status": cctv.status,  # Original status from DB
+                                    "created_at": cctv.created_at.isoformat(),
+                                    "updated_at": cctv.updated_at.isoformat(),
+                                    "rois": [{
+                                        "id": str(roi.id),
+                                        "label": roi.label,
+                                        "coordinates": roi.roi,
+                                        "created_at": roi.created_at.isoformat(),
+                                        "updated_at": roi.updated_at.isoformat()
+                                    } for roi in cctv.rois]
+                                }
+                            }
+                            update_count += 1
+                    
+                    # Progress logging
+                    if batch_num % 5 == 0:  # Log every 5 batches
+                        logging.info(
+                            f"Batch {batch_num+1}/{total_batches} processed, "
+                            f"{update_count}/{len(cctvs)} items updated"
+                        )
+                    
+                    # Throttle between batches
+                    await asyncio.sleep(0.5)  # Reduced delay
+                
+                logging.info(
+                    f"Cache update completed. {update_count} items updated in "
+                    f"{(datetime.now() - start_time).total_seconds():.2f} seconds"
+                )
+                
+        except OperationalError as e:
+            logging.error(f"Database error during cache update: {str(e)}")
+            await asyncio.sleep(60)  # Longer wait for DB errors
         except Exception as e:
-            logging.error(f"Error updating CCTV status cache: {str(e)}")
+            logging.error(f"Unexpected error during cache update: {str(e)}", exc_info=True)
+            await asyncio.sleep(30)
         finally:
-            session.close()
-        await asyncio.sleep(300)  # Sleep for 5 minutes before the next update
-
-async def fetch_cctv_status(cctvs):
-    tasks = []
-    for cctv in cctvs:
-        if not cctv.stream_url:
-            continue
-        
-        cache_key = cctv.stream_url
-        with cache_lock:
-            cached_status = cache.get(cache_key)
-        
-        if cached_status and datetime.datetime.now() < cached_status["expires"]:
-            status = cached_status["status"]
-        else:
-            tasks.append((cctv, asyncio.create_task(test_stream_async(cctv.stream_url))))
-            
-    results = []
-    for cctv, task in tasks:
-        status = await task
-        with cache_lock:
-            cache[cctv.stream_url] = {"status": status, "expires": datetime.datetime.now() + CACHE_EXPIRATION}
-        results.append((cctv, status))  
-
-    for cctv in cctvs:
-        with cache_lock:
-            if cctv.stream_url in cache and not any(task[0] == cctv for task in tasks):
-                results.append((cctv, cache[cctv.stream_url]["status"]))
-
-    return results
+            # Ensure we don't update too frequently even if errors occur
+            elapsed = (datetime.now() - start_time).total_seconds()
+            remaining_wait = max(300 - elapsed, 10)  # At least 10 seconds
+            await asyncio.sleep(remaining_wait)
 
 def start_background_task():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(update_cctv_status_cache()) 
+    
+    try:
+        loop.run_until_complete(update_cctv_status_cache()) 
+    except Exception as e:
+        logging.critical(f"Critical error in background task: {e}", exc_info=True)
+    finally:
+        loop.close()
 
 def create_app():
     app = Flask(__name__)
@@ -171,8 +229,13 @@ def create_app():
     with app.app_context():
         Base.metadata.create_all(bind=engine)
         
-    # Start the background task in a separate thread
-    threading.Thread(target=start_background_task, daemon=True).start()
+    bg_thread = threading.Thread(
+        target = start_background_task,
+        daemon = True,
+        name = "CacheCCTVStatusThread"
+    )
+    
+    bg_thread.start()
     
     @app.route("/hello")
     def index():
@@ -189,90 +252,87 @@ def create_app():
         finally:
             session.close()
             
+    def serialize_cctv(cctv, status=None):
+        """Helper to ensure consistent serialization across both endpoints"""
+        base_data = {
+            "id": str(cctv.id),
+            "nama_lokasi": cctv.nama_lokasi,
+            "nama_cctv": cctv.nama_cctv,
+            "stream_url": cctv.stream_url,
+            "nama_pengelola": cctv.nama_pengelola,
+            "protocol": cctv.protocol,
+            "latitude": float(cctv.latitude) if cctv.latitude else None,
+            "longitude": float(cctv.longitude) if cctv.longitude else None,
+            "source": cctv.source,
+            "tag_kategori": cctv.tag_kategori,
+            "matra": cctv.matra,
+            "nama_kabupaten_kota": cctv.nama_kabupaten_kota,
+            "nama_provinsi": cctv.nama_provinsi,
+            "status": status if status is not None else cctv.status,
+            "created_at": cctv.created_at.isoformat() if cctv.created_at else None,
+            "updated_at": cctv.updated_at.isoformat() if cctv.updated_at else None,
+            "rois": [roi.to_dict() for roi in getattr(cctv, 'rois', [])]
+        }
+        return {cctv.nama_cctv: base_data}
+            
     @app.route("/api/cctv/status/query", methods=["GET"])
     async def get_cctv_status_query():
         status_filter = request.args.get("status")
         limit = request.args.get("limit", type=int)
-        logging.info(f"Status filter: {status_filter}")
-        session = SessionLocal()
+        
         try:
-            cctvs = session.query(MsCCTV).options(joinedload(MsCCTV.rois)).all()
-            cctv_statuses = await fetch_cctv_status(cctvs)
-            
-            results = [
-                {
-                    cctv.nama_cctv : 
-                    {
-                        "id": str(cctv.id),
-                        "nama_lokasi": cctv.nama_lokasi,
-                        "stream_url": cctv.stream_url,
-                        "nama_pengelola": cctv.nama_pengelola,
-                        "protocol": cctv.protocol,
-                        "latitude": cctv.latitude,
-                        "longitude": cctv.longitude,
-                        "source": cctv.source,
-                        "tag_kategori": cctv.tag_kategori,
-                        "matra": cctv.matra,
-                        "nama_kabupaten_kota": cctv.nama_kabupaten_kota,
-                        "nama_provinsi": cctv.nama_provinsi,
-                        "status": status,
-                        "rois" : [roi.to_dict() for roi in cctv.rois]
-                    }
-                }
+            with get_db() as session:
+                # Get full objects including relationships
+                query = session.query(MsCCTV).options(joinedload(MsCCTV.rois))
                 
-                for cctv, status in cctv_statuses
-                if not status_filter or status.lower() == status_filter.lower()
-            ]
-            
-            if limit and limit > 0: 
-                results = results[:limit]
-            
-            logging.info(f"Filtered results: {results}")
-            return jsonify(results)
+                if status_filter:
+                    query = query.filter(MsCCTV.status.ilike(f"%{status_filter}%"))
+                
+                if limit:
+                    query = query.limit(limit)
+                
+                cctvs = query.all()
+                cctv_statuses = await fetch_cctv_status(cctvs)
+                
+                results = {}
+                for cctv, status in cctv_statuses:
+                    results.update(serialize_cctv(cctv, status))
+                
+                return jsonify(results)
+                
         except Exception as e:
-            return jsonify({"error": str(e)}), 500
-        finally:
-            session.close()
+            logging.error(f"Query error: {str(e)}", exc_info=True)
+            return jsonify({"error": "Internal server error"}), 500
     
     #cache
     @app.route("/api/cctv/status", methods=["GET"])
     async def get_cctv_status():
         status_filter = request.args.get("status")
         limit = request.args.get("limit", type=int)
-        logging.info(f"Status filter: {status_filter}, Limit: {limit}")
         
-        try: 
-            results = [
-                {
-                    entry["cctv_data"]["nama_cctv"]: {
-                        "id": entry["cctv_data"]["id"],
-                        "nama_lokasi": entry["cctv_data"]["nama_lokasi"],
-                        "stream_url": entry["cctv_data"]["stream_url"],
-                        "nama_pengelola": entry["cctv_data"]["nama_pengelola"],
-                        "protocol": entry["cctv_data"]["protocol"],
-                        "latitude": entry["cctv_data"]["latitude"],
-                        "longitude": entry["cctv_data"]["longitude"],
-                        "source": entry["cctv_data"]["source"],
-                        "tag_kategori": entry["cctv_data"]["tag_kategori"],
-                        "matra": entry["cctv_data"]["matra"],
-                        "nama_kabupaten_kota": entry["cctv_data"]["nama_kabupaten_kota"],
-                        "nama_provinsi": entry["cctv_data"]["nama_provinsi"],
-                        "status": entry["status"],
-                        "rois": entry["cctv_data"]["rois"] 
+        try:
+            with cache_lock:
+                # Directly use the cached data structure
+                filtered = {
+                    url: {
+                        **data["cctv_data"],
+                        "current_status": data["status"]  # Add current status
                     }
+                    for url, data in cache.items()
+                    if "cctv_data" in data and (
+                        not status_filter or 
+                        data["status"].lower() == status_filter.lower()
+                    )
                 }
-                for entry in cache.values()
-                if "cctv_data" in entry and (not status_filter or entry["status"].lower() == status_filter.lower())
-            ]
-            
-            if limit and limit > 0:
-                results = results[:limit]
-                    
-            logging.info(f"Filtered results: {results}")
-            return jsonify(results)
-        except Exception as e: 
-            logging.error(f"Error fetching CCTV status: {str(e)}")
-            return jsonify({"error": str(e)}), 500
+                
+                if limit and limit > 0:
+                    filtered = dict(list(filtered.items())[:limit])
+                
+                return jsonify(filtered)
+                
+        except Exception as e:
+            logging.error(f"Cache error: {str(e)}", exc_info=True)
+            return jsonify({"error": "Internal server error"}), 500
       
     @app.route("/api/cctv/roi/<id_cctv>", methods=["POST"])
     def update_cctv_roi(id_cctv):
