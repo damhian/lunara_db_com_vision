@@ -11,6 +11,7 @@ from multiprocessing import Process
 from datetime import timedelta, datetime
 from functools import cache
 from flask import Flask, jsonify, request
+from flask_cors import CORS
 from .db import SessionLocal, engine, Base
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import joinedload
@@ -224,6 +225,7 @@ def start_background_task():
 def create_app():
     app = Flask(__name__)
     app.config.from_object("app.config.Config")
+    CORS(app)
 
     # Initialize the database
     with app.app_context():
