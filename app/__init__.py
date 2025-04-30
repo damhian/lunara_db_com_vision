@@ -335,6 +335,27 @@ def create_app():
         except Exception as e:
             logging.error(f"Cache error: {str(e)}", exc_info=True)
             return jsonify({"error": "Internal server error"}), 500
+        
+    @app.route("/api/cctv/roi/<id_cctv>", methods=["GET"])
+    def get_cctv_roi(id_cctv):
+        session = SessionLocal()
+        try:
+            cctv = session.query(MsCCTV).filter(MsCCTV.id == id_cctv).first()
+            if not cctv:
+                return jsonify({"error": "CCTV not found"}), 404
+            
+            # Get all ROIs for the CCTV
+            rois = session.query(MsROI).filter(MsROI.id_cctv == id_cctv).all()
+            
+            # Serialize the CCTV and ROIs
+            cctv_data = cctv.to_dict()
+            cctv_data["rois"] = [roi.to_dict() for roi in rois]
+            
+            return jsonify(cctv_data)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        finally:
+            session.close()
       
     @app.route("/api/cctv/roi/<id_cctv>", methods=["POST"])
     def update_cctv_roi(id_cctv):
