@@ -336,7 +336,7 @@ def create_app():
             logging.error(f"Cache error: {str(e)}", exc_info=True)
             return jsonify({"error": "Internal server error"}), 500
         
-    @app.route("/api/cctv/roi/<id_cctv>", methods=["GET"])
+    @app.route("/api/cctv/<id_cctv>", methods=["GET"])
     def get_cctv_roi(id_cctv):
         session = SessionLocal()
         try:
