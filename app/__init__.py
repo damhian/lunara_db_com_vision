@@ -365,25 +365,48 @@ def create_app():
             if not cctv:
                 return jsonify({"error": "CCTV not found"}), 404
             data = request.json
-            if "roi" not in data or "label" not in data:
-                return jsonify({"error": "ROI and Label data are required"}), 400
             
-            # Update the CCTV ROI
-            cctv.ROI = data["roi"]
+            if "rois" not in data or not isinstance(data["rois"], list):
+                return jsonify({"error": "ROIs must be provided as a list"}), 400
             
-            # Add new ROI data to MsROI
-            new_roi = MsROI(
-                id_cctv=id_cctv,
-                nama_cctv=cctv.nama_cctv,
-                label=data["label"],
-                roi=data["roi"],
-                created_at=datetime.datetime.now(),
-                updated_at=datetime.datetime.now()
-            )
-            session.add(new_roi)
+            created_rois = []
             
+            for idx, roi_data in enumerate(data["rois"]):
+            # roi_data should be a dict with 'roi' and 'label'
+                roi = roi_data.get("roi")
+                label = roi_data.get("label")
+
+                if roi is None or label is None:
+                    return jsonify({"error": f"Each ROI must have 'roi' and 'label'. Error at index {idx}"}), 400
+
+                new_roi = MsROI(
+                    id_cctv=id_cctv,
+                    nama_cctv=cctv.nama_cctv,
+                    label=label,
+                    roi=roi,
+                    created_at=datetime.now(),
+                    updated_at=datetime.now()
+                )
+                session.add(new_roi)
+                created_rois.append({
+                    "id_cctv": id_cctv,
+                    "nama_cctv": cctv.nama_cctv,
+                    "label": label,
+                    "roi": roi,
+                })
+            
+            # Optional: set the first ROI as the main CCTV ROI
+            if created_rois:
+                cctv.ROI = created_rois[0]["roi"]
+
             session.commit()
-            return jsonify(cctv.to_dict())
+
+            return jsonify({
+                "message": "ROIs successfully created",
+                "cctv": cctv.to_dict(),
+                "rois": created_rois
+            }), 201
+
         except Exception as e:
             return jsonify({"error": str(e)}), 500
         finally:
